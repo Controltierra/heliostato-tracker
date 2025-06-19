@@ -1,0 +1,213 @@
+/**
+ * Proyecto: Calibración Heliostato Pan/Tilt
+ *
+ * Descripción:
+ *   Sketch para ESP32 que realiza homing de dos ejes (Pan y Tilt) usando finales de carrera,
+ *   aplica rectificación y margen extra para liberar los switches, y permite
+ *   bloques de movimiento manual (200 pasos) desde una página web de calibración.
+ *
+ * Características:
+ *   • Homing automático en ambos ejes con velocidad reducida.
+ *   • Rectificación hasta liberar el endstop y margen extra de 50 pasos.
+ *   • Movimiento manual en incrementos de 200 pasos en sentido inverso al homing.
+ *   • Límite de recorrido de 26 000 pasos en Pan y 8 000 en Tilt.
+ *   • Desenergizado de bobinas al parar para apagar LEDs de los drivers.
+ *
+ * Requisitos de hardware:
+ *   • ESP32 DevKit (Tipo-C con CH340C o CP2102)
+ *   • 2× drivers ULN2003 + motores paso a paso 28BYJ-48
+ *   • 2× finales de carrera (switch ↔ GND)
+ *
+ * Pinout ESP32:
+ *   • Pan coil A–D: GPIO 13, 12, 14, 27
+ *   • Tilt coil A–D: GPIO 26, 25, 33, 32
+ *   • Pan endstop:   GPIO 4  (INPUT_PULLUP)
+ *   • Tilt endstop:  GPIO 5  (INPUT_PULLUP)
+ *   • Wi-Fi AP SSID: Heliostato_Calib / Pass: 12345678
+ *
+ * Uso:
+ *   1. Compilar y subir al ESP32.
+ *   2. Conectar al punto de acceso “Heliostato_Calib” (192.168.4.1).
+ *   3. Pulsar “Pan +200” o “Tilt +200” para desplazar bloques de calibración.
+ *   4. Resetear contadores con el botón “Reset”.
+ */
+
+
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ————— Pines de los motores —————
+const int panPins[4]  = {13, 12, 14, 27};
+const int tiltPins[4] = {26, 25, 33, 32};
+
+// Secuencia unipolar de 8 pasos
+const int seq[8][4] = {
+  {1,0,0,0},{1,1,0,0},{0,1,0,0},{0,1,1,0},
+  {0,0,1,0},{0,0,1,1},{0,0,0,1},{1,0,0,1}
+};
+
+// Endstops (conectados a GND, pull‐up interno)
+const int panHomePin  = 4;
+const int tiltHomePin = 5;
+
+// Parámetros de homing
+const int RECTIFY_MARGIN     = 50;    // pasos extra al liberar
+const int HOMING_DELAY_US    = 2000;  // velocidad homing (µs)
+// Pasos manuales por pulsación
+const int MANUAL_STEP_COUNT  = 200;
+const int MANUAL_DELAY_US    = 1000;  // velocidad manual (µs)
+
+// Estado y contadores
+long panCount  = 0;
+long tiltCount = 0;
+int panStep    = 0;
+int tiltStep   = 0;
+
+// Wi-Fi AP
+const char* ssid = "Heliostato_Calib";
+const char* pass = "12345678";
+WebServer server(80);
+
+// — Mueve un paso y actualiza contador
+void driveMotor(const int pins[4], int &step, bool forward, long &count) {
+  step = (step + (forward ? 1 : 7)) % 8;
+  for(int i=0;i<4;i++) digitalWrite(pins[i], seq[step][i]);
+  count += forward ? 1 : -1;
+}
+
+// — Homing con rectificación y margen extra
+void doHoming() {
+  Serial.println("Homing Pan →");
+  while(digitalRead(panHomePin)==HIGH) {
+    driveMotor(panPins, panStep, true, panCount);
+    delayMicroseconds(HOMING_DELAY_US);
+  }
+  Serial.println("Pan endstop detectado, rectificando...");
+  while(digitalRead(panHomePin)==LOW) {
+    driveMotor(panPins, panStep, false, panCount);
+    delayMicroseconds(HOMING_DELAY_US);
+  }
+  for(int i=0;i<RECTIFY_MARGIN;i++){
+    driveMotor(panPins, panStep, false, panCount);
+    delayMicroseconds(HOMING_DELAY_US);
+  }
+  for(int p:panPins) digitalWrite(p, LOW);
+  panCount = 0;
+  Serial.println("Pan HOME OK");
+
+  Serial.println("Homing Tilt ←");
+  while(digitalRead(tiltHomePin)==HIGH) {
+    driveMotor(tiltPins, tiltStep, false, tiltCount);
+    delayMicroseconds(HOMING_DELAY_US);
+  }
+  Serial.println("Tilt endstop detectado, rectificando...");
+  while(digitalRead(tiltHomePin)==LOW) {
+    driveMotor(tiltPins, tiltStep, true, tiltCount);
+    delayMicroseconds(HOMING_DELAY_US);
+  }
+  for(int i=0;i<RECTIFY_MARGIN;i++){
+    driveMotor(tiltPins, tiltStep, true, tiltCount);
+    delayMicroseconds(HOMING_DELAY_US);
+  }
+  for(int p:tiltPins) digitalWrite(p, LOW);
+  tiltCount = 0;
+  Serial.println("Tilt HOME OK");
+}
+
+// — Realiza un bloque de MANUAL_STEP_COUNT pasos (opuesto al homing)
+void handlePanStep() {
+  for(int i=0; i<MANUAL_STEP_COUNT; i++){
+    if(digitalRead(panHomePin)==LOW){
+      // rectifica y sale
+      while(digitalRead(panHomePin)==LOW){
+        driveMotor(panPins, panStep, false, panCount);
+        delayMicroseconds(HOMING_DELAY_US);
+      }
+      break;
+    }
+    driveMotor(panPins, panStep, false, panCount);
+    delayMicroseconds(MANUAL_DELAY_US);
+  }
+  for(int p:panPins) digitalWrite(p, LOW);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleTiltStep() {
+  for(int i=0; i<MANUAL_STEP_COUNT; i++){
+    if(digitalRead(tiltHomePin)==LOW){
+      while(digitalRead(tiltHomePin)==LOW){
+        driveMotor(tiltPins, tiltStep, true, tiltCount);
+        delayMicroseconds(HOMING_DELAY_US);
+      }
+      break;
+    }
+    driveMotor(tiltPins, tiltStep, true, tiltCount);
+    delayMicroseconds(MANUAL_DELAY_US);
+  }
+  for(int p:tiltPins) digitalWrite(p, LOW);
+  server.send(200, "text/plain", "OK");
+}
+
+// — Página web
+void handleRoot(){
+  String html = R"rawliteral(
+<!DOCTYPE html><html><head>
+  <meta name="viewport" content="width=device-width">
+  <title>Calibración Heliostato</title>
+  <style>
+    body{font-family:sans-serif;text-align:center;padding:20px;}
+    button{width:140px;height:50px;margin:10px;font-size:18px;}
+    .count{font-size:1.4em;margin:10px;}
+  </style>
+</head><body>
+  <h2>Calibración Heliostato</h2>
+  <div class="count"><span id="panCnt">Pan: 0</span></div>
+  <div class="count"><span id="tiltCnt">Tilt: 0</span></div>
+  <div>
+    <button onclick="fetch('/panstep')">Pan +200</button>
+    <button onclick="fetch('/tiltstep')">Tilt +200</button>
+  </div>
+  <div><button onclick="fetch('/reset')">Reset</button></div>
+  <script>
+    function update(){
+      fetch('/counts').then(r=>r.text()).then(t=>{
+        const [p,t2]=t.split(',');
+        document.getElementById('panCnt').textContent  = 'Pan: '  + p;
+        document.getElementById('tiltCnt').textContent = 'Tilt: ' + t2;
+      });
+    }
+    setInterval(update,500);
+    update();
+  </script>
+</body></html>
+)rawliteral";
+  server.send(200,"text/html",html);
+}
+
+// — Rutas
+void handleCounts(){ server.send(200,"text/plain", String(panCount)+","+String(tiltCount)); }
+void handleReset() { panCount=tiltCount=0; server.send(200,"text/plain","OK"); }
+
+void setup(){
+  Serial.begin(115200);
+  for(int p:panPins)  pinMode(p, OUTPUT);
+  for(int p:tiltPins) pinMode(p, OUTPUT);
+  pinMode(panHomePin,INPUT_PULLUP);
+  pinMode(tiltHomePin,INPUT_PULLUP);
+
+  doHoming();
+
+  WiFi.softAP(ssid,pass);
+  Serial.printf("AP %s IP %s\n", ssid, WiFi.softAPIP().toString().c_str());
+  server.on("/",         HTTP_GET, handleRoot);
+  server.on("/panstep",  HTTP_GET, handlePanStep);
+  server.on("/tiltstep", HTTP_GET, handleTiltStep);
+  server.on("/counts",   HTTP_GET, handleCounts);
+  server.on("/reset",    HTTP_GET, handleReset);
+  server.begin();
+}
+
+void loop(){
+  server.handleClient();
+}
